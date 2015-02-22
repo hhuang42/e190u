@@ -91,6 +91,8 @@ unsigned int image_width = 512;
 unsigned int image_height = 512;
 int iGLUTWindowHandle = 0;          // handle to the GLUT window
 
+uchar4* motion_blur_buffer;
+
 // pbo and fbo variables
 #ifdef USE_TEXSUBIMAGE2D
 GLuint pbo_dest;
@@ -178,7 +180,7 @@ bool IsOpenGLAvailable(const char *appName)
 ////////////////////////////////////////////////////////////////////////////////
 extern "C" void
 launch_cudaProcess(dim3 grid, dim3 block, int sbytes,
-                   cudaArray *g_data, unsigned int *g_odata,
+                   cudaArray *g_data, uchar4* motion_buffer, unsigned int *g_odata,
                    int imgw, int imgh, int tilew,
                    int radius, float threshold, float highlight);
 
@@ -242,7 +244,7 @@ void process(int width, int height, int radius)
 
     // execute CUDA kernel
     launch_cudaProcess(grid, block, sbytes,
-                       in_array, out_data, width, height,
+                       in_array, motion_blur_buffer, out_data, width, height,
                        block.x+(2*radius), radius, 0.8f, 4.0f);
 
     checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_tex_screen_resource, 0));
@@ -839,6 +841,7 @@ void FreeResource()
 #else
     cudaFree(cuda_dest_resource);
 #endif
+    cudaFree(motion_blur_buffer);
     deleteTexture(&tex_screen);
     deleteTexture(&tex_cudaResult);
     deleteDepthBuffer(&depth_buffer);
@@ -956,17 +959,21 @@ GLuint compileGLSLprogram(const char *vertex_shader_src, const char *fragment_sh
 ////////////////////////////////////////////////////////////////////////////////
 //! Allocate the "render target" of CUDA
 ////////////////////////////////////////////////////////////////////////////////
-#ifndef USE_TEXSUBIMAGE2D
+
 void initCUDABuffers()
 {
     // set up vertex data parameter
     num_texels = image_width * image_height;
     num_values = num_texels * 4;
     size_tex_data = sizeof(GLubyte) * num_values;
+    size_t size_buf_data = num_texels * sizeof(uchar4);
+#ifndef USE_TEXSUBIMAGE2D
     checkCudaErrors(cudaMalloc((void **)&cuda_dest_resource, size_tex_data));
+#endif
+    checkCudaErrors(cudaMalloc((void **)&motion_blur_buffer, size_buf_data));
     //checkCudaErrors(cudaHostAlloc((void**)&cuda_dest_resource, size_tex_data, ));
 }
-#endif
+
 
 ////////////////////////////////////////////////////////////////////////////////
 //!
@@ -1034,9 +1041,8 @@ runStdProgram(int argc, char **argv)
     glutAttachMenu(GLUT_RIGHT_BUTTON);
 
     initGLBuffers();
-#ifndef USE_TEXSUBIMAGE2D
+
     initCUDABuffers();
-#endif
 
     // Creating the Auto-Validation Code
     if (ref_file)

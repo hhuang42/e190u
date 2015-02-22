@@ -40,7 +40,15 @@ __device__ int rgbToInt(float r, float g, float b)
 }
 
 // get pixel from 2D image, with clamping to border
-__device__ uchar4 getPixel(int x, int y)
+__device__ uchar4 getPixel(int x, int y, int imgw, int imgh, uchar4* buffer)
+{
+    y = clamp(y, 0, imgh-1);
+    x = clamp(x, 0, imgw-1);
+    return buffer[y*imgw + x];
+}
+
+// get pixel from 2D image, with clamping to border
+__device__ void setPixel(int x, int y, int imgw, uchar4* buffer)
 {
 #ifndef USE_TEXTURE_RGBA8UI
     float4 res = tex2D(inTex, x, y);
@@ -48,7 +56,14 @@ __device__ uchar4 getPixel(int x, int y)
 #else
     uchar4 ucres = tex2D(inTex, x, y);
 #endif
-    return ucres;
+
+    int old_c = 30;
+    int new_c = 1;
+    int total = old_c + new_c;
+    buffer[y*imgw + x].x = 255 - (total*255 - new_c*ucres.x - old_c*buffer[y*imgw + x].x)/total;
+    buffer[y*imgw + x].y = 255 - (total*255 - new_c*ucres.y - old_c*buffer[y*imgw + x].y)/total;
+    buffer[y*imgw + x].z = 255 - (total*255 - new_c*ucres.z - old_c*buffer[y*imgw + x].z)/total;
+    buffer[y*imgw + x].w = 255 - (total*255 - new_c*ucres.w - old_c*buffer[y*imgw + x].w)/total;
 }
 
 // macros to make indexing shared memory easier
@@ -72,7 +87,7 @@ __device__ uchar4 getPixel(int x, int y)
 */
 
 __global__ void
-cudaProcess(unsigned int *g_odata, int imgw, int imgh,
+cudaProcess(unsigned int *g_odata, uchar4 * motion_buffer, int imgw, int imgh,
             int tilew, int r, float threshold, float highlight)
 {
     extern __shared__ uchar4 sdata[];
@@ -84,42 +99,44 @@ cudaProcess(unsigned int *g_odata, int imgw, int imgh,
     int x = blockIdx.x*bw + tx;
     int y = blockIdx.y*bh + ty;
 
-#if 0
-    uchar4 c4 = getPixel(x, y);
-    g_odata[y*imgw+x] = rgbToInt(c4.z, c4.y, c4.x);
-#else
+
+    // perform motion blur
+    
+    setPixel(x, y, imgw, motion_buffer);
+    
+    __syncthreads();
     // copy tile to shared memory
     // center region
-    SMEM(r + tx, r + ty) = getPixel(x, y);
+    SMEM(r + tx, r + ty) = getPixel(x, y, imgw, imgh, motion_buffer);
 
     // borders
     if (threadIdx.x < r)
     {
         // left
-        SMEM(tx, r + ty) = getPixel(x - r, y);
+        SMEM(tx, r + ty) = getPixel(x - r, y, imgw, imgh, motion_buffer);
         // right
-        SMEM(r + bw + tx, r + ty) = getPixel(x + bw, y);
+        SMEM(r + bw + tx, r + ty) = getPixel(x + bw, y, imgw, imgh, motion_buffer);
     }
 
     if (threadIdx.y < r)
     {
         // top
-        SMEM(r + tx, ty) = getPixel(x, y - r);
+        SMEM(r + tx, ty) = getPixel(x, y - r, imgw, imgh, motion_buffer);
         // bottom
-        SMEM(r + tx, r + bh + ty) = getPixel(x, y + bh);
+        SMEM(r + tx, r + bh + ty) = getPixel(x, y + bh, imgw, imgh, motion_buffer);
     }
 
     // load corners
     if ((threadIdx.x < r) && (threadIdx.y < r))
     {
         // tl
-        SMEM(tx, ty) = getPixel(x - r, y - r);
+        SMEM(tx, ty) = getPixel(x - r, y - r, imgw, imgh, motion_buffer);
         // bl
-        SMEM(tx, r + bh + ty) = getPixel(x - r, y + bh);
+        SMEM(tx, r + bh + ty) = getPixel(x - r, y + bh, imgw, imgh, motion_buffer);
         // tr
-        SMEM(r + bw + tx, ty) = getPixel(x + bh, y - r);
+        SMEM(r + bw + tx, ty) = getPixel(x + bh, y - r, imgw, imgh, motion_buffer);
         // br
-        SMEM(r + bw + tx, r + bh + ty) = getPixel(x + bw, y + bh);
+        SMEM(r + bw + tx, r + bh + ty) = getPixel(x + bw, y + bh, imgw, imgh, motion_buffer);
     }
 
     // wait for loads to complete
@@ -135,13 +152,7 @@ cudaProcess(unsigned int *g_odata, int imgw, int imgh,
     {
         for (int dx=-r; dx<=r; dx++)
         {
-#if 0
-            // try this to see the benefit of using shared memory
-            uchar4 pixel = getPixel(x+dx, y+dy);
-#else
             uchar4 pixel = SMEM(r+tx+dx, r+ty+dy);
-#endif
-
             // only sum pixels within disc-shaped kernel
             float l = dx*dx + dy*dy;
 
@@ -150,7 +161,6 @@ cudaProcess(unsigned int *g_odata, int imgw, int imgh,
                 float r = float(pixel.x);
                 float g = float(pixel.y);
                 float b = float(pixel.z);
-#if 1
                 // brighten highlights
                 float lum = (r + g + b) / (255*3);
 
@@ -161,7 +171,6 @@ cudaProcess(unsigned int *g_odata, int imgw, int imgh,
                     b *= highlight;
                 }
 
-#endif
                 rsum += r;
                 gsum += g;
                 bsum += b;
@@ -176,12 +185,11 @@ cudaProcess(unsigned int *g_odata, int imgw, int imgh,
     // ABGR
     g_odata[y*imgw+x] = rgbToInt(rsum, gsum, bsum);
     //g_odata[y*imgw+x] = rgbToInt(x,y,0);
-#endif
 }
 
 extern "C" void
 launch_cudaProcess(dim3 grid, dim3 block, int sbytes,
-                   cudaArray *g_data_array, unsigned int *g_odata,
+                   cudaArray *g_data_array, uchar4* motion_buffer, unsigned int *g_odata,
                    int imgw, int imgh, int tilew,
                    int radius, float threshold, float highlight)
 {
@@ -190,50 +198,9 @@ launch_cudaProcess(dim3 grid, dim3 block, int sbytes,
     struct cudaChannelFormatDesc desc;
     checkCudaErrors(cudaGetChannelDesc(&desc, g_data_array));
 
-#if 0
-    printf("CUDA Array channel descriptor, bits per component:\n");
-    printf("X %d Y %d Z %d W %d, kind %d\n",
-           desc.x,desc.y,desc.z,desc.w,desc.f);
 
-    printf("Possible values for channel format kind: i %d, u%d, f%d:\n",
-           cudaChannelFormatKindSigned, cudaChannelFormatKindUnsigned,
-           cudaChannelFormatKindFloat);
-#endif
 
-    //printf("\n");
-#ifdef GPU_PROFILING
-    StopWatchInterface *timer = 0;
-    sdkCreateTimer(&timer);
-
-    int nIter = 30;
-
-    for (int i = -1; i < nIter; ++i)
-    {
-        if (i == 0)
-        {
-            sdkStartTimer(&timer);
-        }
-
-#endif
-
-        cudaProcess<<< grid, block, sbytes >>>(g_odata, imgw, imgh,
+        cudaProcess<<< grid, block, sbytes >>>(g_odata, motion_buffer, imgw, imgh,
                                                block.x+(2*radius), radius, 0.8f, 4.0f);
 
-#ifdef GPU_PROFILING
-    }
-
-    cudaDeviceSynchronize();
-    sdkStopTimer(&timer);
-    double dSeconds = sdkGetTimerValue(&timer)/((double)nIter * 1000.0);
-    double dNumTexels = (double)imgw * (double)imgh;
-    double mtexps = 1.0e-6 * dNumTexels/dSeconds;
-
-    if (radius == 4)
-    {
-        printf("\n");
-        printf("postprocessGL, Throughput = %.4f MTexels/s, Time = %.5f s, Size = %.0f Texels, NumDevsUsed = %d, Workgroup = %u\n",
-               mtexps, dSeconds, dNumTexels, 1, block.x * block.y);
-    }
-
-#endif
 }
